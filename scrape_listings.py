@@ -1,53 +1,62 @@
 """
 Scrape used SUV listings from multiple sources.
 
+Uses cloudscraper to bypass Cloudflare anti-bot protection that blocks
+plain requests on AutoTrader and CarGurus.
+
 Sources tried in order:
-1. MarketCheck via RapidAPI (best structured data, requires API key)
-2. AutoTrader (fetch searchresults.xhtml, parse mountRoot() embedded JSON)
-3. CarGurus AJAX endpoint (ajaxFetchSubsetInventoryListing.action)
+1. MarketCheck via RapidAPI (structured API, requires subscription)
+2. AutoTrader (HTML scrape with cloudscraper + mountRoot JSON extraction)
+3. CarGurus (AJAX endpoint with cloudscraper)
 """
 
 import json
 import re
 import time
 
+import cloudscraper
 import requests
 from bs4 import BeautifulSoup
 from config import SEARCH_PARAMS
 
 
+def _create_scraper():
+    """
+    Create a cloudscraper session that can bypass Cloudflare protection.
+    cloudscraper is a drop-in replacement for requests.Session that
+    automatically solves Cloudflare challenges.
+    """
+    scraper = cloudscraper.create_scraper(
+        browser={
+            "browser": "chrome",
+            "platform": "windows",
+            "desktop": True,
+        }
+    )
+    scraper.trust_env = False  # Ignore proxy env vars
+    return scraper
+
+
 def _create_session():
-    """Create a requests session with no proxy (bypass any env proxy)."""
+    """Plain requests session for APIs that don't need bot bypass."""
     session = requests.Session()
-    session.trust_env = False  # Ignore HTTP_PROXY/HTTPS_PROXY env vars
+    session.trust_env = False
     return session
 
 
 # ---------------------------------------------------------------------------
-# AutoTrader  (fetch HTML, extract mountRoot() JSON)
+# AutoTrader  (cloudscraper + mountRoot JSON extraction)
 # ---------------------------------------------------------------------------
 
 def fetch_listings_autotrader():
     """
-    Fetch used SUV listings from AutoTrader.
+    Fetch used SUV listings from AutoTrader using cloudscraper.
 
-    AutoTrader no longer exposes a clean JSON REST API. Instead we fetch the
-    search-results HTML page (searchresults.xhtml) and extract the JSON blob
-    that is passed to their mountRoot() bootstrapper.
+    AutoTrader embeds listing data as JSON inside a mountRoot() call
+    in the search results HTML page. We use cloudscraper to bypass
+    their Cloudflare protection and extract that JSON.
     """
-    session = _create_session()
-
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-    })
+    scraper = _create_scraper()
 
     all_listings = []
     first_record = 0
@@ -57,7 +66,6 @@ def fetch_listings_autotrader():
     print(f"[autotrader] Searching for used SUVs near {SEARCH_PARAMS['zip_code']}...")
 
     while first_record < max_results:
-        # Use the searchresults.xhtml page URL (the HTML page that embeds JSON)
         params = {
             "zip": SEARCH_PARAMS["zip_code"],
             "searchRadius": SEARCH_PARAMS["radius_miles"],
@@ -71,63 +79,71 @@ def fetch_listings_autotrader():
         }
 
         try:
-            resp = session.get(
+            resp = scraper.get(
                 "https://www.autotrader.com/cars-for-sale/searchresults.xhtml",
                 params=params,
                 timeout=30,
             )
             resp.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            print(f"[autotrader] HTTP {resp.status_code} at offset {first_record}")
-            break
-        except requests.exceptions.RequestException as e:
-            print(f"[autotrader] Request error at offset {first_record}: {e}")
+        except Exception as e:
+            print(f"[autotrader] Error at offset {first_record}: {e}")
             break
 
         html = resp.text
 
-        # Extract JSON from mountRoot() call embedded in the page
+        # Extract JSON from mountRoot() or other embedded data
         data = _extract_autotrader_json(html)
         if data is None:
             if first_record == 0:
-                print("[autotrader] Could not find mountRoot() data in page HTML")
-                # Maybe we got a CAPTCHA or redirect
                 if "captcha" in html.lower() or "challenge" in html.lower():
-                    print("[autotrader] Bot detection / CAPTCHA triggered")
+                    print("[autotrader] Bot detection still triggered despite cloudscraper")
+                else:
+                    print("[autotrader] Could not find listing data in page")
+                    # Debug: show a snippet of what we got
+                    print(f"[autotrader] Page length: {len(html)} chars, "
+                          f"title: {_extract_title(html)}")
             break
 
-        # The listing data lives in data["inventory"] or data["listings"]
         inventory = data.get("inventory", data.get("listings", []))
         if not inventory:
             if first_record == 0:
-                print(f"[autotrader] No inventory in data. Top keys: {list(data.keys())[:10]}")
+                print(f"[autotrader] No inventory key. Top keys: "
+                      f"{list(data.keys())[:10]}")
             break
 
-        total_count = data.get("totalResultCount", data.get("totalCount", len(inventory)))
+        total_count = data.get("totalResultCount",
+                               data.get("totalCount", len(inventory)))
 
         for raw in inventory:
             parsed = _parse_autotrader_listing(raw)
             if parsed["make"] and parsed["model"]:
                 all_listings.append(parsed)
 
-        print(f"[autotrader] Fetched {len(all_listings)} / {min(total_count, max_results)}")
+        print(f"[autotrader] Fetched {len(all_listings)} / "
+              f"{min(total_count, max_results)}")
 
         first_record += page_size
         if first_record >= total_count:
             break
 
-        time.sleep(2.0)
+        time.sleep(2.5)
 
     print(f"[autotrader] Done. Total: {len(all_listings)}")
     return all_listings
 
 
+def _extract_title(html):
+    """Quick helper to get page title for debugging."""
+    m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    return m.group(1).strip() if m else "(no title)"
+
+
 def _extract_autotrader_json(html):
     """
-    Extract the JSON data blob from AutoTrader's HTML page.
-    AT embeds listing data inside a mountRoot({...}) call in a <script> tag.
+    Extract the JSON data blob from AutoTrader HTML page.
+    AT embeds listing data inside mountRoot({...}) in a <script> tag.
     """
-    # Pattern 1: mountRoot(JSON)
+    # Pattern 1: mountRoot(JSON)  -- the main one
     match = re.search(r'mountRoot\((\{.+?\})\);\s*</script>', html, re.DOTALL)
     if match:
         try:
@@ -135,16 +151,22 @@ def _extract_autotrader_json(html):
         except json.JSONDecodeError:
             pass
 
-    # Pattern 2: window.__BONNET_DATA__ = JSON
-    match = re.search(r'window\.__BONNET_DATA__\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
+    # Pattern 2: window.__BONNET_DATA__
+    match = re.search(
+        r'window\.__BONNET_DATA__\s*=\s*(\{.+?\});\s*</script>',
+        html, re.DOTALL
+    )
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
 
-    # Pattern 3: __NEXT_DATA__ (if AT migrated to Next.js)
-    match = re.search(r'__NEXT_DATA__\s*=\s*(\{.+?\})\s*;?\s*</script>', html, re.DOTALL)
+    # Pattern 3: __NEXT_DATA__
+    match = re.search(
+        r'__NEXT_DATA__\s*=\s*(\{.+?\})\s*;?\s*</script>',
+        html, re.DOTALL
+    )
     if match:
         try:
             data = json.loads(match.group(1))
@@ -152,15 +174,14 @@ def _extract_autotrader_json(html):
         except json.JSONDecodeError:
             pass
 
-    # Pattern 4: look for large JSON blobs in script tags
+    # Pattern 4: search for large JSON with inventory/listings arrays
     soup = BeautifulSoup(html, "lxml")
     for script in soup.find_all("script"):
         text = script.string or ""
-        if '"inventory"' in text or '"listings"' in text:
-            # Try to find a JSON object containing inventory
+        if len(text) > 1000 and ('"inventory"' in text or '"listings"' in text):
             for pat in [
-                r'(\{"inventory"\s*:\s*\[.+?\].*?\})',
-                r'(\{"listings"\s*:\s*\[.+?\].*?\})',
+                r'(\{"inventory"\s*:\s*\[.+?\]\s*[,}])',
+                r'(\{"listings"\s*:\s*\[.+?\]\s*[,}])',
             ]:
                 m = re.search(pat, text, re.DOTALL)
                 if m:
@@ -190,10 +211,13 @@ def _parse_autotrader_listing(raw):
         "model": raw.get("modelString", raw.get("model", "")),
         "year": raw.get("year", ""),
         "trim": raw.get("trimString", raw.get("trim", "")),
-        "price": pricing.get("primary", pricing.get("salePrice", raw.get("price", ""))),
+        "price": pricing.get("primary", pricing.get("salePrice",
+                 raw.get("price", ""))),
         "mileage": spec_val("mileage"),
-        "exterior_color": raw.get("exteriorColorSimple", raw.get("exteriorColor", "")),
-        "interior_color": raw.get("interiorColorSimple", raw.get("interiorColor", "")),
+        "exterior_color": raw.get("exteriorColorSimple",
+                          raw.get("exteriorColor", "")),
+        "interior_color": raw.get("interiorColorSimple",
+                          raw.get("interiorColor", "")),
         "engine": spec_val("engine"),
         "transmission": spec_val("transmission"),
         "drivetrain": spec_val("drivetrain"),
@@ -218,67 +242,54 @@ def _parse_autotrader_listing(raw):
 
 
 # ---------------------------------------------------------------------------
-# CarGurus  (AJAX endpoint returns JSON directly)
+# CarGurus  (cloudscraper + AJAX endpoint)
 # ---------------------------------------------------------------------------
 
 def fetch_listings_cargurus():
     """
-    Fetch used SUV listings from CarGurus using their AJAX endpoint.
+    Fetch used SUV listings from CarGurus using cloudscraper.
 
-    The correct endpoint is ajaxFetchSubsetInventoryListing.action (NOT
-    searchResults.action which returns 406). The AJAX endpoint returns JSON
-    when called with X-Requested-With: XMLHttpRequest.
+    Uses the ajaxFetchSubsetInventoryListing.action AJAX endpoint which
+    returns JSON when called with X-Requested-With: XMLHttpRequest.
     """
     print("[cargurus] Searching for used SUVs...")
-    session = _create_session()
+    scraper = _create_scraper()
 
-    # First, hit the main search page to get a session cookie
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-    })
-
-    # Warm up session with a page load to get cookies
+    # Step 1: Load the search page to get session cookies
+    print("[cargurus] Warming up session...")
     try:
-        session.headers["Accept"] = (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        )
-        warmup = session.get(
+        warmup_resp = scraper.get(
             "https://www.cargurus.com/Cars/inventorylisting/"
             "viewDetailsFilterViewInventoryListing.action",
             params={
                 "zip": SEARCH_PARAMS["zip_code"],
                 "inventorySearchWidgetType": "AUTO",
                 "distance": SEARCH_PARAMS["radius_miles"],
+                "bodyTypeGroup": "bg_suv_702",
+                "startYear": SEARCH_PARAMS["year_min"],
+                "endYear": SEARCH_PARAMS["year_max"],
             },
             timeout=30,
         )
-        warmup.raise_for_status()
-        print("[cargurus] Session cookies acquired")
-    except requests.exceptions.RequestException as e:
-        print(f"[cargurus] Cookie warmup failed: {e}")
-        # Try to continue anyway
+        warmup_resp.raise_for_status()
+        print(f"[cargurus] Session ready (cookies: "
+              f"{len(scraper.cookies)})")
 
-    # Now use the AJAX endpoint that returns JSON
+        # Try to extract listings from the warmup HTML page directly
+        html_listings = _extract_cargurus_from_html(warmup_resp.text)
+        if html_listings:
+            print(f"[cargurus] Found {len(html_listings)} listings in HTML")
+            return html_listings
+
+    except Exception as e:
+        print(f"[cargurus] Warmup error: {e}")
+        # Continue anyway - the AJAX call might still work
+
+    # Step 2: Call the AJAX endpoint for JSON data
     ajax_url = (
         "https://www.cargurus.com/Cars/inventorylisting/"
         "ajaxFetchSubsetInventoryListing.action"
     )
-
-    # Set AJAX headers — these are critical to get JSON back
-    session.headers.update({
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": (
-            "https://www.cargurus.com/Cars/inventorylisting/"
-            "viewDetailsFilterViewInventoryListing.action"
-        ),
-    })
 
     all_listings = []
     page = 1
@@ -301,51 +312,93 @@ def fetch_listings_cargurus():
             "isRecentSearchView": "false",
         }
 
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": (
+                "https://www.cargurus.com/Cars/inventorylisting/"
+                "viewDetailsFilterViewInventoryListing.action"
+            ),
+        }
+
         try:
-            resp = session.get(ajax_url, params=params, timeout=30)
+            resp = scraper.get(
+                ajax_url, params=params, headers=headers, timeout=30
+            )
             resp.raise_for_status()
 
-            # Verify we got JSON
-            ct = resp.headers.get("Content-Type", "")
-            if "json" in ct or "javascript" in ct:
+            try:
                 data = resp.json()
-            else:
-                # Sometimes CG returns JSON with wrong content-type
-                try:
-                    data = resp.json()
-                except ValueError:
-                    print(f"[cargurus] Non-JSON response on page {page} (CT: {ct})")
-                    if page == 1:
-                        # Fall back to HTML parsing
-                        return _parse_cargurus_html_fallback(session)
-                    break
+            except ValueError:
+                if page == 1:
+                    print(f"[cargurus] AJAX returned non-JSON "
+                          f"(CT: {resp.headers.get('Content-Type', '?')})")
+                break
 
-        except requests.exceptions.HTTPError as e:
-            print(f"[cargurus] HTTP {resp.status_code} on page {page}")
-            if page == 1:
-                return _parse_cargurus_html_fallback(session)
-            break
-        except requests.exceptions.RequestException as e:
-            print(f"[cargurus] Error on page {page}: {e}")
+        except Exception as e:
+            print(f"[cargurus] AJAX error on page {page}: {e}")
             break
 
-        # Parse listings from JSON response
         page_listings = _extract_cargurus_json(data)
         if not page_listings:
             if page == 1:
-                print(f"[cargurus] No listings in JSON response. "
-                      f"Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                return _parse_cargurus_html_fallback(session)
+                print(f"[cargurus] No listings in AJAX response")
             break
 
         all_listings.extend(page_listings)
         print(f"[cargurus] Fetched {len(all_listings)} listings (page {page})")
 
         page += 1
-        time.sleep(2.0)
+        time.sleep(2.5)
 
     print(f"[cargurus] Done. Total: {len(all_listings)}")
     return all_listings
+
+
+def _extract_cargurus_from_html(html):
+    """Extract listings directly from CarGurus HTML page."""
+    listings = []
+    soup = BeautifulSoup(html, "lxml")
+
+    # Method 1: JSON-LD structured data
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if item.get("@type") in ("Car", "Vehicle"):
+                    listings.append(_parse_jsonld_car(item))
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    if listings:
+        return listings
+
+    # Method 2: Embedded JS data
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if len(text) < 500:
+            continue
+
+        for pattern in [
+            r'"listings"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"results"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"inventoryListings"\s*:\s*(\[.*?\])\s*[,}]',
+        ]:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    items = json.loads(match.group(1))
+                    for item in items:
+                        listing = _parse_cargurus_item(item)
+                        if listing:
+                            listings.append(listing)
+                    if listings:
+                        return listings
+                except json.JSONDecodeError:
+                    continue
+
+    return listings
 
 
 def _extract_cargurus_json(data):
@@ -353,19 +406,20 @@ def _extract_cargurus_json(data):
     listings = []
 
     if isinstance(data, dict):
-        # The AJAX response has listings at various possible paths
         raw_items = (
             data.get("listings", [])
             or data.get("results", [])
             or data.get("inventoryListings", [])
         )
 
-        # Sometimes nested under a key
         if not raw_items:
             for key in data:
                 val = data[key]
-                if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
-                    if any(k in val[0] for k in ("makeName", "modelName", "price", "vin")):
+                if isinstance(val, list) and len(val) > 0:
+                    if isinstance(val[0], dict) and any(
+                        k in val[0] for k in
+                        ("makeName", "modelName", "price", "vin")
+                    ):
                         raw_items = val
                         break
 
@@ -383,85 +437,8 @@ def _extract_cargurus_json(data):
     return listings
 
 
-def _parse_cargurus_html_fallback(session):
-    """
-    Fallback: if the AJAX endpoint fails, try parsing the HTML search page
-    for embedded JSON data or JSON-LD structured data.
-    """
-    print("[cargurus] Trying HTML fallback...")
-    session.headers["Accept"] = (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    )
-    session.headers.pop("X-Requested-With", None)
-
-    try:
-        resp = session.get(
-            "https://www.cargurus.com/Cars/inventorylisting/"
-            "viewDetailsFilterViewInventoryListing.action",
-            params={
-                "zip": SEARCH_PARAMS["zip_code"],
-                "distance": SEARCH_PARAMS["radius_miles"],
-                "bodyTypeGroup": "bg_suv_702",
-                "startYear": SEARCH_PARAMS["year_min"],
-                "endYear": SEARCH_PARAMS["year_max"],
-                "inventorySearchWidgetType": "AUTO",
-                "sortDir": "ASC",
-                "sortType": "DEAL_SCORE",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"[cargurus] HTML fallback failed: {e}")
-        return []
-
-    listings = []
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    # Try JSON-LD structured data
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if item.get("@type") in ("Car", "Vehicle"):
-                    listings.append(_parse_jsonld_car(item))
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-    if listings:
-        print(f"[cargurus] HTML fallback found {len(listings)} listings via JSON-LD")
-        return listings
-
-    # Try embedded JS data
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        for pattern in [
-            r'"listings"\s*:\s*(\[.*?\])\s*[,}]',
-            r'"results"\s*:\s*(\[.*?\])\s*[,}]',
-            r'"inventoryListings"\s*:\s*(\[.*?\])\s*[,}]',
-        ]:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                try:
-                    items = json.loads(match.group(1))
-                    for item in items:
-                        listing = _parse_cargurus_item(item)
-                        if listing:
-                            listings.append(listing)
-                    if listings:
-                        print(f"[cargurus] HTML fallback found {len(listings)} "
-                              f"listings in embedded JS")
-                        return listings
-                except json.JSONDecodeError:
-                    continue
-
-    print("[cargurus] HTML fallback found no listings")
-    return listings
-
-
 def _parse_jsonld_car(item):
-    """Parse a JSON-LD Car/Vehicle schema into our listing format."""
+    """Parse JSON-LD Car/Vehicle into our listing format."""
     offers = item.get("offers", {})
     seller = offers.get("seller", item.get("seller", {}))
     brand = item.get("brand", {})
@@ -504,7 +481,7 @@ def _parse_jsonld_car(item):
 
 
 def _parse_cargurus_item(item):
-    """Parse a CarGurus listing item from AJAX or embedded data."""
+    """Parse a CarGurus listing item."""
     if not isinstance(item, dict):
         return None
 
@@ -522,10 +499,13 @@ def _parse_cargurus_item(item):
         "model": model,
         "year": item.get("carYear", item.get("year", "")),
         "trim": item.get("trimName", item.get("trim", "")),
-        "price": item.get("price", item.get("expectedPrice", item.get("listPrice", ""))),
+        "price": item.get("price", item.get("expectedPrice",
+                 item.get("listPrice", ""))),
         "mileage": item.get("mileage", item.get("mileageString", "")),
-        "exterior_color": item.get("exteriorColorName", item.get("exteriorColor", "")),
-        "interior_color": item.get("interiorColorName", item.get("interiorColor", "")),
+        "exterior_color": item.get("exteriorColorName",
+                          item.get("exteriorColor", "")),
+        "interior_color": item.get("interiorColorName",
+                          item.get("interiorColor", "")),
         "engine": item.get("engine", ""),
         "transmission": item.get("transmission", ""),
         "drivetrain": item.get("driveTrain", item.get("driveType", "")),
@@ -538,7 +518,8 @@ def _parse_cargurus_item(item):
         "seller_type": "dealer" if item.get("dealerName") else "private",
         "seller_city": item.get("dealerCity", item.get("sellerCity", "")),
         "seller_state": item.get("dealerState", item.get("sellerState", "")),
-        "seller_distance_mi": item.get("distanceFromSearchZip", item.get("distance", "")),
+        "seller_distance_mi": item.get("distanceFromSearchZip",
+                              item.get("distance", "")),
         "listing_url": url,
         "days_on_market": item.get("daysOnMarket", ""),
         "accidents_reported": item.get("accidentCount", ""),
@@ -551,13 +532,15 @@ def _parse_cargurus_item(item):
 # MarketCheck via RapidAPI
 # ---------------------------------------------------------------------------
 
+# The RapidAPI proxy host for MarketCheck is marketcheck-prod.apigee.net
+# (per official SDK). When accessed via RapidAPI, the X-RapidAPI-Host
+# header tells RapidAPI's gateway which backend to route to.
+_MC_RAPIDAPI_HOST = "marketcheck-prod.apigee.net"
+
+
 def fetch_listings_marketcheck():
     """
     Fetch used SUV listings via MarketCheck API on RapidAPI.
-    MarketCheck aggregates 14M+ listings from 50k+ US dealers.
-
-    The correct RapidAPI host is marketcheck-prod.apigee.net (confirmed
-    from official SDK and documentation).
     """
     from config import RAPIDAPI_KEY
 
@@ -570,67 +553,67 @@ def fetch_listings_marketcheck():
         SEARCH_PARAMS["year_min"], SEARCH_PARAMS["year_max"] + 1
     ))
 
-    print("[marketcheck] Querying MarketCheck API for used SUVs...")
+    print("[marketcheck] Querying MarketCheck API...")
 
+    # RapidAPI routes the request: we call the RapidAPI gateway URL
+    # with the X-RapidAPI-Host header set to the API's host
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "marketcheck-prod.apigee.net",
+        "X-RapidAPI-Host": _MC_RAPIDAPI_HOST,
+        "Accept": "application/json",
     }
 
+    params = {
+        "car_type": "used",
+        "body_type": "SUV",
+        "year": years,
+        "zip": SEARCH_PARAMS["zip_code"],
+        "radius": SEARCH_PARAMS["radius_miles"],
+        "rows": 50,
+        "start": 0,
+        "sort_by": "price",
+        "sort_order": "asc",
+    }
+
+    # The URL must go through RapidAPI's gateway, not directly to apigee
+    url = f"https://{_MC_RAPIDAPI_HOST}/v2/search/car/active"
+
     all_listings = []
-    page_size = 50
-    start = 0
     max_results = SEARCH_PARAMS["max_results"]
 
-    while start < max_results:
-        params = {
-            "car_type": "used",
-            "body_type": "SUV",
-            "year": years,
-            "zip": SEARCH_PARAMS["zip_code"],
-            "radius": SEARCH_PARAMS["radius_miles"],
-            "rows": page_size,
-            "start": start,
-            "sort_by": "price",
-            "sort_order": "asc",
-        }
-
+    while params["start"] < max_results:
         try:
-            resp = session.get(
-                "https://marketcheck-prod.apigee.net/v2/search/car/active",
-                headers=headers,
-                params=params,
-                timeout=30,
-            )
+            resp = session.get(url, headers=headers, params=params, timeout=30)
 
             if resp.status_code in (401, 403):
-                error_msg = ""
                 try:
-                    error_msg = resp.json().get("message", resp.text[:200])
+                    msg = resp.json().get("message", resp.text[:300])
                 except ValueError:
-                    error_msg = resp.text[:200]
-                print(f"[marketcheck] Auth error ({resp.status_code}): {error_msg}")
-                print("[marketcheck] Verify your RapidAPI key is subscribed to "
-                      "the MarketCheck 'Cars Search' API at rapidapi.com")
+                    msg = resp.text[:300]
+                print(f"[marketcheck] Auth error ({resp.status_code}): {msg}")
+                print("[marketcheck] You may need to subscribe to MarketCheck's "
+                      "'Cars Search' API at https://rapidapi.com/marketcheck/api/cars-search")
                 return []
 
             resp.raise_for_status()
             data = resp.json()
-        except requests.exceptions.HTTPError as e:
-            print(f"[marketcheck] HTTP error at offset {start}: {e}")
-            break
+        except requests.exceptions.ConnectionError as e:
+            print(f"[marketcheck] Connection failed: {e}")
+            print("[marketcheck] The MarketCheck API host may not be directly "
+                  "accessible. Ensure your RapidAPI subscription is active.")
+            return []
         except (requests.exceptions.RequestException, ValueError) as e:
-            print(f"[marketcheck] Error at offset {start}: {e}")
+            print(f"[marketcheck] Error: {e}")
             break
 
         listings = data.get("listings", [])
         if not listings:
-            if start == 0:
+            if params["start"] == 0:
                 if "error" in data or "message" in data:
-                    print(f"[marketcheck] API message: "
+                    print(f"[marketcheck] API: "
                           f"{data.get('error', data.get('message', ''))}")
                 else:
-                    print(f"[marketcheck] Empty response. Keys: {list(data.keys())}")
+                    print(f"[marketcheck] Empty. Keys: {list(data.keys())}")
             break
 
         total = data.get("num_found", 0)
@@ -645,12 +628,17 @@ def fetch_listings_marketcheck():
                 "trim": item.get("trim", build.get("trim", "")),
                 "price": item.get("price", ""),
                 "mileage": item.get("miles", item.get("mileage", "")),
-                "exterior_color": item.get("exterior_color", build.get("exterior_color", "")),
-                "interior_color": item.get("interior_color", build.get("interior_color", "")),
+                "exterior_color": item.get("exterior_color",
+                                  build.get("exterior_color", "")),
+                "interior_color": item.get("interior_color",
+                                  build.get("interior_color", "")),
                 "engine": build.get("engine", item.get("engine", "")),
-                "transmission": build.get("transmission", item.get("transmission", "")),
-                "drivetrain": build.get("drivetrain", item.get("drivetrain", "")),
-                "fuel_type": build.get("fuel_type", item.get("fuel_type", "")),
+                "transmission": build.get("transmission",
+                                item.get("transmission", "")),
+                "drivetrain": build.get("drivetrain",
+                              item.get("drivetrain", "")),
+                "fuel_type": build.get("fuel_type",
+                             item.get("fuel_type", "")),
                 "mpg_city": build.get("city_mpg", ""),
                 "mpg_highway": build.get("highway_mpg", ""),
                 "vin": item.get("vin", ""),
@@ -661,7 +649,8 @@ def fetch_listings_marketcheck():
                 "seller_state": dealer.get("state", ""),
                 "seller_distance_mi": item.get("dist", ""),
                 "listing_url": item.get("vdp_url", ""),
-                "days_on_market": item.get("dom", item.get("days_on_market", "")),
+                "days_on_market": item.get("dom",
+                                  item.get("days_on_market", "")),
                 "accidents_reported": "",
                 "owner_count": "",
                 "carfax_one_owner": item.get("carfax_1_owner", ""),
@@ -670,10 +659,11 @@ def fetch_listings_marketcheck():
             if listing["make"] and listing["model"]:
                 all_listings.append(listing)
 
-        print(f"[marketcheck] Fetched {len(all_listings)} / {min(total, max_results)}")
+        print(f"[marketcheck] Fetched {len(all_listings)} / "
+              f"{min(total, max_results)}")
 
-        start += page_size
-        if start >= total:
+        params["start"] += params["rows"]
+        if params["start"] >= total:
             break
 
         time.sleep(1.0)
@@ -698,12 +688,12 @@ def get_all_listings():
     if listings:
         return listings
 
-    # Fallback to AutoTrader (HTML scraping)
+    # Fallback to AutoTrader (cloudscraper + HTML parsing)
     listings = fetch_listings_autotrader()
     if listings:
         return listings
 
-    # Fallback to CarGurus (AJAX endpoint)
+    # Fallback to CarGurus (cloudscraper + AJAX)
     listings = fetch_listings_cargurus()
     if listings:
         return listings
