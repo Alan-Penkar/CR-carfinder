@@ -3,8 +3,8 @@ Scrape used SUV listings from multiple sources.
 
 Sources tried in order:
 1. MarketCheck via RapidAPI (best structured data, requires API key)
-2. AutoTrader internal API (free, no key needed)
-3. CarGurus internal API (free, no key needed)
+2. AutoTrader (fetch searchresults.xhtml, parse mountRoot() embedded JSON)
+3. CarGurus AJAX endpoint (ajaxFetchSubsetInventoryListing.action)
 """
 
 import json
@@ -24,32 +24,29 @@ def _create_session():
 
 
 # ---------------------------------------------------------------------------
-# AutoTrader
+# AutoTrader  (fetch HTML, extract mountRoot() JSON)
 # ---------------------------------------------------------------------------
 
 def fetch_listings_autotrader():
     """
-    Fetch used SUV listings from AutoTrader's internal search API.
-    The key is matching the exact headers their frontend sends.
+    Fetch used SUV listings from AutoTrader.
+
+    AutoTrader no longer exposes a clean JSON REST API. Instead we fetch the
+    search-results HTML page (searchresults.xhtml) and extract the JSON blob
+    that is passed to their mountRoot() bootstrapper.
     """
     session = _create_session()
 
-    # Headers must closely match a real browser or AT returns HTML/403
-    search_url = (
-        f"https://www.autotrader.com/cars-for-sale/used-cars/suv/"
-        f"atlanta-ga-{SEARCH_PARAMS['zip_code']}"
-    )
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/125.0.0.0 Safari/537.36"
         ),
-        "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br",
-        "accept-language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control": "no-cache",
-        "referer": search_url,
     })
 
     all_listings = []
@@ -60,6 +57,7 @@ def fetch_listings_autotrader():
     print(f"[autotrader] Searching for used SUVs near {SEARCH_PARAMS['zip_code']}...")
 
     while first_record < max_results:
+        # Use the searchresults.xhtml page URL (the HTML page that embeds JSON)
         params = {
             "zip": SEARCH_PARAMS["zip_code"],
             "searchRadius": SEARCH_PARAMS["radius_miles"],
@@ -70,45 +68,44 @@ def fetch_listings_autotrader():
             "sortBy": "relevance",
             "numRecords": page_size,
             "firstRecord": first_record,
-            "channel": "ATC",
         }
 
         try:
             resp = session.get(
-                "https://www.autotrader.com/rest/searchresults/base",
+                "https://www.autotrader.com/cars-for-sale/searchresults.xhtml",
                 params=params,
                 timeout=30,
             )
             resp.raise_for_status()
-
-            # Check if response is JSON (AT sometimes returns HTML on bot detection)
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and "javascript" not in content_type:
-                # Try parsing anyway - sometimes CT header is wrong
-                try:
-                    data = resp.json()
-                except ValueError:
-                    print(f"[autotrader] Got non-JSON response (likely bot detection). "
-                          f"Content-Type: {content_type}")
-                    break
-            else:
-                data = resp.json()
-
         except requests.exceptions.HTTPError as e:
             print(f"[autotrader] HTTP {resp.status_code} at offset {first_record}")
             break
-        except (requests.exceptions.RequestException, ValueError) as e:
-            print(f"[autotrader] Error at offset {first_record}: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"[autotrader] Request error at offset {first_record}: {e}")
             break
 
-        listings = data.get("listings", [])
-        if not listings:
+        html = resp.text
+
+        # Extract JSON from mountRoot() call embedded in the page
+        data = _extract_autotrader_json(html)
+        if data is None:
             if first_record == 0:
-                print(f"[autotrader] No listings in response. Keys: {list(data.keys())}")
+                print("[autotrader] Could not find mountRoot() data in page HTML")
+                # Maybe we got a CAPTCHA or redirect
+                if "captcha" in html.lower() or "challenge" in html.lower():
+                    print("[autotrader] Bot detection / CAPTCHA triggered")
             break
 
-        total_count = data.get("totalResultCount", 0)
-        for raw in listings:
+        # The listing data lives in data["inventory"] or data["listings"]
+        inventory = data.get("inventory", data.get("listings", []))
+        if not inventory:
+            if first_record == 0:
+                print(f"[autotrader] No inventory in data. Top keys: {list(data.keys())[:10]}")
+            break
+
+        total_count = data.get("totalResultCount", data.get("totalCount", len(inventory)))
+
+        for raw in inventory:
             parsed = _parse_autotrader_listing(raw)
             if parsed["make"] and parsed["model"]:
                 all_listings.append(parsed)
@@ -125,6 +122,56 @@ def fetch_listings_autotrader():
     return all_listings
 
 
+def _extract_autotrader_json(html):
+    """
+    Extract the JSON data blob from AutoTrader's HTML page.
+    AT embeds listing data inside a mountRoot({...}) call in a <script> tag.
+    """
+    # Pattern 1: mountRoot(JSON)
+    match = re.search(r'mountRoot\((\{.+?\})\);\s*</script>', html, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Pattern 2: window.__BONNET_DATA__ = JSON
+    match = re.search(r'window\.__BONNET_DATA__\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Pattern 3: __NEXT_DATA__ (if AT migrated to Next.js)
+    match = re.search(r'__NEXT_DATA__\s*=\s*(\{.+?\})\s*;?\s*</script>', html, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            return data.get("props", {}).get("pageProps", data)
+        except json.JSONDecodeError:
+            pass
+
+    # Pattern 4: look for large JSON blobs in script tags
+    soup = BeautifulSoup(html, "lxml")
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if '"inventory"' in text or '"listings"' in text:
+            # Try to find a JSON object containing inventory
+            for pat in [
+                r'(\{"inventory"\s*:\s*\[.+?\].*?\})',
+                r'(\{"listings"\s*:\s*\[.+?\].*?\})',
+            ]:
+                m = re.search(pat, text, re.DOTALL)
+                if m:
+                    try:
+                        return json.loads(m.group(1))
+                    except json.JSONDecodeError:
+                        continue
+
+    return None
+
+
 def _parse_autotrader_listing(raw):
     """Extract fields from an AutoTrader listing dict."""
     specs = raw.get("specifications", {})
@@ -136,15 +183,17 @@ def _parse_autotrader_listing(raw):
         v = specs.get(key, {})
         return v.get("value", "") if isinstance(v, dict) else v
 
+    listing_id = raw.get("id", raw.get("listingId", ""))
+
     return {
-        "make": raw.get("makeString", ""),
-        "model": raw.get("modelString", ""),
+        "make": raw.get("makeString", raw.get("make", "")),
+        "model": raw.get("modelString", raw.get("model", "")),
         "year": raw.get("year", ""),
-        "trim": raw.get("trimString", ""),
-        "price": pricing.get("primary", pricing.get("salePrice", "")),
+        "trim": raw.get("trimString", raw.get("trim", "")),
+        "price": pricing.get("primary", pricing.get("salePrice", raw.get("price", ""))),
         "mileage": spec_val("mileage"),
-        "exterior_color": raw.get("exteriorColorSimple", ""),
-        "interior_color": raw.get("interiorColorSimple", ""),
+        "exterior_color": raw.get("exteriorColorSimple", raw.get("exteriorColor", "")),
+        "interior_color": raw.get("interiorColorSimple", raw.get("interiorColor", "")),
         "engine": spec_val("engine"),
         "transmission": spec_val("transmission"),
         "drivetrain": spec_val("drivetrain"),
@@ -160,7 +209,7 @@ def _parse_autotrader_listing(raw):
         "seller_distance_mi": raw.get("distanceFromSearch", ""),
         "listing_url": (
             f"https://www.autotrader.com/cars-for-sale/vehicledetails.xhtml"
-            f"?listingId={raw.get('id', '')}"
+            f"?listingId={listing_id}"
         ),
         "days_on_market": raw.get("daysOnMarket", ""),
         "accidents_reported": raw.get("accidentCount", ""),
@@ -169,178 +218,245 @@ def _parse_autotrader_listing(raw):
 
 
 # ---------------------------------------------------------------------------
-# CarGurus
+# CarGurus  (AJAX endpoint returns JSON directly)
 # ---------------------------------------------------------------------------
 
 def fetch_listings_cargurus():
     """
-    Fetch used SUV listings from CarGurus.
-    Uses their inventory listing page and extracts embedded JSON data.
+    Fetch used SUV listings from CarGurus using their AJAX endpoint.
+
+    The correct endpoint is ajaxFetchSubsetInventoryListing.action (NOT
+    searchResults.action which returns 406). The AJAX endpoint returns JSON
+    when called with X-Requested-With: XMLHttpRequest.
     """
     print("[cargurus] Searching for used SUVs...")
     session = _create_session()
 
-    # CarGurus needs full browser-like headers to avoid 406
+    # First, hit the main search page to get a session cookie
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/125.0.0.0 Safari/537.36"
         ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,image/apng,*/*;q=0.8"
-        ),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
+    })
+
+    # Warm up session with a page load to get cookies
+    try:
+        session.headers["Accept"] = (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        warmup = session.get(
+            "https://www.cargurus.com/Cars/inventorylisting/"
+            "viewDetailsFilterViewInventoryListing.action",
+            params={
+                "zip": SEARCH_PARAMS["zip_code"],
+                "inventorySearchWidgetType": "AUTO",
+                "distance": SEARCH_PARAMS["radius_miles"],
+            },
+            timeout=30,
+        )
+        warmup.raise_for_status()
+        print("[cargurus] Session cookies acquired")
+    except requests.exceptions.RequestException as e:
+        print(f"[cargurus] Cookie warmup failed: {e}")
+        # Try to continue anyway
+
+    # Now use the AJAX endpoint that returns JSON
+    ajax_url = (
+        "https://www.cargurus.com/Cars/inventorylisting/"
+        "ajaxFetchSubsetInventoryListing.action"
+    )
+
+    # Set AJAX headers — these are critical to get JSON back
+    session.headers.update({
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": (
+            "https://www.cargurus.com/Cars/inventorylisting/"
+            "viewDetailsFilterViewInventoryListing.action"
+        ),
     })
 
     all_listings = []
-    offset = 0
-    page_size = 15  # CG returns ~15 per page in HTML
+    page = 1
+    max_pages = SEARCH_PARAMS["max_results"] // 15 + 1
 
-    while offset < SEARCH_PARAMS["max_results"]:
-        # Use the inventory listing page URL
-        url = (
-            "https://www.cargurus.com/Cars/inventorylisting/"
-            "viewDetailsFilterViewInventoryListing.action"
-        )
+    while page <= max_pages:
         params = {
+            "sourceContext": "carGurusHomePageModel",
             "zip": SEARCH_PARAMS["zip_code"],
-            "inventorySearchWidgetType": "AUTO",
-            "bodyTypeGroup": "bg_suv_702",
+            "distance": SEARCH_PARAMS["radius_miles"],
             "startYear": SEARCH_PARAMS["year_min"],
             "endYear": SEARCH_PARAMS["year_max"],
-            "distance": SEARCH_PARAMS["radius_miles"],
+            "bodyTypeGroup": "bg_suv_702",
+            "inventorySearchWidgetType": "AUTO",
             "sortDir": "ASC",
             "sortType": "DEAL_SCORE",
-            "offset": offset,
-            "maxResults": page_size,
-            "filtersModified": "true",
+            "page": page,
+            "allYearsForTrimName": "true",
+            "displayFeaturedListings": "true",
+            "isRecentSearchView": "false",
         }
 
         try:
-            resp = session.get(url, params=params, timeout=30)
+            resp = session.get(ajax_url, params=params, timeout=30)
             resp.raise_for_status()
+
+            # Verify we got JSON
+            ct = resp.headers.get("Content-Type", "")
+            if "json" in ct or "javascript" in ct:
+                data = resp.json()
+            else:
+                # Sometimes CG returns JSON with wrong content-type
+                try:
+                    data = resp.json()
+                except ValueError:
+                    print(f"[cargurus] Non-JSON response on page {page} (CT: {ct})")
+                    if page == 1:
+                        # Fall back to HTML parsing
+                        return _parse_cargurus_html_fallback(session)
+                    break
+
         except requests.exceptions.HTTPError as e:
-            print(f"[cargurus] HTTP {resp.status_code} at offset {offset}")
-            # Try alternative URL pattern
-            if offset == 0:
-                alt = _fetch_cargurus_alt(session)
-                if alt:
-                    return alt
+            print(f"[cargurus] HTTP {resp.status_code} on page {page}")
+            if page == 1:
+                return _parse_cargurus_html_fallback(session)
             break
         except requests.exceptions.RequestException as e:
-            print(f"[cargurus] Error at offset {offset}: {e}")
+            print(f"[cargurus] Error on page {page}: {e}")
             break
 
-        # Parse embedded JSON from the HTML
-        page_listings = _extract_cargurus_listings(resp.text)
-
+        # Parse listings from JSON response
+        page_listings = _extract_cargurus_json(data)
         if not page_listings:
-            if offset == 0:
-                print("[cargurus] No listings found in page HTML")
-                # Try alternative approach
-                alt = _fetch_cargurus_alt(session)
-                if alt:
-                    return alt
+            if page == 1:
+                print(f"[cargurus] No listings in JSON response. "
+                      f"Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                return _parse_cargurus_html_fallback(session)
             break
 
         all_listings.extend(page_listings)
-        print(f"[cargurus] Fetched {len(all_listings)} listings so far")
+        print(f"[cargurus] Fetched {len(all_listings)} listings (page {page})")
 
-        if len(page_listings) < page_size:
-            break
-
-        offset += page_size
+        page += 1
         time.sleep(2.0)
 
     print(f"[cargurus] Done. Total: {len(all_listings)}")
     return all_listings
 
 
-def _fetch_cargurus_alt(session):
-    """
-    Alternative CarGurus approach: use their search results page
-    which sometimes has a different anti-bot policy.
-    """
-    print("[cargurus] Trying alternative URL pattern...")
-
-    url = "https://www.cargurus.com/Cars/l-Used-SUV_702-Atlanta_L14607"
-    try:
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
-        listings = _extract_cargurus_listings(resp.text)
-        if listings:
-            print(f"[cargurus] Alt found {len(listings)} listings")
-            return listings
-    except requests.exceptions.RequestException as e:
-        print(f"[cargurus] Alt approach failed: {e}")
-
-    return []
-
-
-def _extract_cargurus_listings(html):
-    """Extract listing data from CarGurus HTML page."""
+def _extract_cargurus_json(data):
+    """Extract listings from CarGurus AJAX JSON response."""
     listings = []
-    soup = BeautifulSoup(html, "lxml")
 
-    # Method 1: Look for JSON-LD structured data
+    if isinstance(data, dict):
+        # The AJAX response has listings at various possible paths
+        raw_items = (
+            data.get("listings", [])
+            or data.get("results", [])
+            or data.get("inventoryListings", [])
+        )
+
+        # Sometimes nested under a key
+        if not raw_items:
+            for key in data:
+                val = data[key]
+                if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                    if any(k in val[0] for k in ("makeName", "modelName", "price", "vin")):
+                        raw_items = val
+                        break
+
+        for item in raw_items:
+            listing = _parse_cargurus_item(item)
+            if listing:
+                listings.append(listing)
+
+    elif isinstance(data, list):
+        for item in data:
+            listing = _parse_cargurus_item(item)
+            if listing:
+                listings.append(listing)
+
+    return listings
+
+
+def _parse_cargurus_html_fallback(session):
+    """
+    Fallback: if the AJAX endpoint fails, try parsing the HTML search page
+    for embedded JSON data or JSON-LD structured data.
+    """
+    print("[cargurus] Trying HTML fallback...")
+    session.headers["Accept"] = (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
+    session.headers.pop("X-Requested-With", None)
+
+    try:
+        resp = session.get(
+            "https://www.cargurus.com/Cars/inventorylisting/"
+            "viewDetailsFilterViewInventoryListing.action",
+            params={
+                "zip": SEARCH_PARAMS["zip_code"],
+                "distance": SEARCH_PARAMS["radius_miles"],
+                "bodyTypeGroup": "bg_suv_702",
+                "startYear": SEARCH_PARAMS["year_min"],
+                "endYear": SEARCH_PARAMS["year_max"],
+                "inventorySearchWidgetType": "AUTO",
+                "sortDir": "ASC",
+                "sortType": "DEAL_SCORE",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[cargurus] HTML fallback failed: {e}")
+        return []
+
+    listings = []
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # Try JSON-LD structured data
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
-            if isinstance(data, list):
-                for item in data:
-                    if item.get("@type") == "Car" or item.get("@type") == "Vehicle":
-                        listings.append(_parse_jsonld_car(item))
-            elif isinstance(data, dict) and data.get("@type") in ("Car", "Vehicle"):
-                listings.append(_parse_jsonld_car(data))
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if item.get("@type") in ("Car", "Vehicle"):
+                    listings.append(_parse_jsonld_car(item))
         except (json.JSONDecodeError, KeyError):
             continue
 
     if listings:
+        print(f"[cargurus] HTML fallback found {len(listings)} listings via JSON-LD")
         return listings
 
-    # Method 2: Look for embedded JS data (window.__PREFLIGHT_DATA__ etc.)
+    # Try embedded JS data
     for script in soup.find_all("script"):
         text = script.string or ""
-
-        # Try various embedded data patterns
         for pattern in [
-            r'window\.__PREFLIGHT_DATA__\s*=\s*({.*?});',
-            r'window\.__NEXT_DATA__\s*=\s*({.*?});',
-            r'"results"\s*:\s*(\[.*?\])\s*[,}]',
             r'"listings"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"results"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"inventoryListings"\s*:\s*(\[.*?\])\s*[,}]',
         ]:
             match = re.search(pattern, text, re.DOTALL)
             if match:
                 try:
-                    data = json.loads(match.group(1))
-                    if isinstance(data, list):
-                        for item in data:
-                            listing = _parse_cargurus_item(item)
-                            if listing:
-                                listings.append(listing)
-                    elif isinstance(data, dict):
-                        # Nested structure
-                        for key in ("results", "listings", "inventory"):
-                            items = data.get(key, [])
-                            if isinstance(items, list):
-                                for item in items:
-                                    listing = _parse_cargurus_item(item)
-                                    if listing:
-                                        listings.append(listing)
+                    items = json.loads(match.group(1))
+                    for item in items:
+                        listing = _parse_cargurus_item(item)
+                        if listing:
+                            listings.append(listing)
                     if listings:
+                        print(f"[cargurus] HTML fallback found {len(listings)} "
+                              f"listings in embedded JS")
                         return listings
-                except (json.JSONDecodeError, ValueError):
+                except json.JSONDecodeError:
                     continue
 
+    print("[cargurus] HTML fallback found no listings")
     return listings
 
 
@@ -348,16 +464,26 @@ def _parse_jsonld_car(item):
     """Parse a JSON-LD Car/Vehicle schema into our listing format."""
     offers = item.get("offers", {})
     seller = offers.get("seller", item.get("seller", {}))
+    brand = item.get("brand", {})
+
     return {
-        "make": item.get("brand", {}).get("name", item.get("manufacturer", "")),
+        "make": brand.get("name", "") if isinstance(brand, dict) else str(brand),
         "model": item.get("model", ""),
         "year": item.get("vehicleModelDate", item.get("productionDate", "")),
         "trim": item.get("vehicleConfiguration", ""),
         "price": offers.get("price", ""),
-        "mileage": item.get("mileageFromOdometer", {}).get("value", ""),
+        "mileage": (
+            item.get("mileageFromOdometer", {}).get("value", "")
+            if isinstance(item.get("mileageFromOdometer"), dict)
+            else item.get("mileageFromOdometer", "")
+        ),
         "exterior_color": item.get("color", ""),
         "interior_color": item.get("vehicleInteriorColor", ""),
-        "engine": item.get("vehicleEngine", {}).get("name", "") if isinstance(item.get("vehicleEngine"), dict) else "",
+        "engine": (
+            item.get("vehicleEngine", {}).get("name", "")
+            if isinstance(item.get("vehicleEngine"), dict)
+            else str(item.get("vehicleEngine", ""))
+        ),
         "transmission": item.get("vehicleTransmission", ""),
         "drivetrain": item.get("driveWheelConfiguration", ""),
         "fuel_type": item.get("fuelType", ""),
@@ -378,7 +504,7 @@ def _parse_jsonld_car(item):
 
 
 def _parse_cargurus_item(item):
-    """Parse a CarGurus listing item from embedded JS data."""
+    """Parse a CarGurus listing item from AJAX or embedded data."""
     if not isinstance(item, dict):
         return None
 
@@ -386,6 +512,10 @@ def _parse_cargurus_item(item):
     model = item.get("modelName", item.get("model", ""))
     if not make or not model:
         return None
+
+    url = item.get("url", item.get("listingUrl", ""))
+    if url and url.startswith("/"):
+        url = f"https://www.cargurus.com{url}"
 
     return {
         "make": make,
@@ -409,13 +539,10 @@ def _parse_cargurus_item(item):
         "seller_city": item.get("dealerCity", item.get("sellerCity", "")),
         "seller_state": item.get("dealerState", item.get("sellerState", "")),
         "seller_distance_mi": item.get("distanceFromSearchZip", item.get("distance", "")),
-        "listing_url": (
-            f"https://www.cargurus.com{item['url']}"
-            if item.get("url", "").startswith("/") else item.get("url", "")
-        ),
+        "listing_url": url,
         "days_on_market": item.get("daysOnMarket", ""),
-        "accidents_reported": "",
-        "owner_count": "",
+        "accidents_reported": item.get("accidentCount", ""),
+        "owner_count": item.get("ownerCount", ""),
         "deal_rating": item.get("dealRating", item.get("dealScore", "")),
     }
 
@@ -424,18 +551,13 @@ def _parse_cargurus_item(item):
 # MarketCheck via RapidAPI
 # ---------------------------------------------------------------------------
 
-# Known RapidAPI host variants for MarketCheck
-_MC_HOSTS = [
-    "marketcheck-prod.apigee.net",
-    "cars-search.p.rapidapi.com",
-    "marketcheck.p.rapidapi.com",
-]
-
-
 def fetch_listings_marketcheck():
     """
     Fetch used SUV listings via MarketCheck API on RapidAPI.
-    Tries multiple known host variants.
+    MarketCheck aggregates 14M+ listings from 50k+ US dealers.
+
+    The correct RapidAPI host is marketcheck-prod.apigee.net (confirmed
+    from official SDK and documentation).
     """
     from config import RAPIDAPI_KEY
 
@@ -450,18 +572,11 @@ def fetch_listings_marketcheck():
 
     print("[marketcheck] Querying MarketCheck API for used SUVs...")
 
-    for host in _MC_HOSTS:
-        print(f"[marketcheck] Trying host: {host}")
-        result = _try_marketcheck_host(session, host, RAPIDAPI_KEY, years)
-        if result:
-            return result
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "marketcheck-prod.apigee.net",
+    }
 
-    print("[marketcheck] All host variants failed")
-    return []
-
-
-def _try_marketcheck_host(session, host, api_key, years):
-    """Try fetching from a specific MarketCheck host."""
     all_listings = []
     page_size = 50
     start = 0
@@ -480,34 +595,42 @@ def _try_marketcheck_host(session, host, api_key, years):
             "sort_order": "asc",
         }
 
-        headers = {
-            "X-RapidAPI-Key": api_key,
-            "X-RapidAPI-Host": host,
-        }
-
         try:
-            # Use the host in the URL
-            url = f"https://{host}/v2/search/car/active"
-            resp = session.get(url, headers=headers, params=params, timeout=30)
+            resp = session.get(
+                "https://marketcheck-prod.apigee.net/v2/search/car/active",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
 
-            if resp.status_code in (401, 403, 404):
-                print(f"[marketcheck] {host} returned {resp.status_code}")
-                return []  # Wrong host, try next
+            if resp.status_code in (401, 403):
+                error_msg = ""
+                try:
+                    error_msg = resp.json().get("message", resp.text[:200])
+                except ValueError:
+                    error_msg = resp.text[:200]
+                print(f"[marketcheck] Auth error ({resp.status_code}): {error_msg}")
+                print("[marketcheck] Verify your RapidAPI key is subscribed to "
+                      "the MarketCheck 'Cars Search' API at rapidapi.com")
+                return []
 
             resp.raise_for_status()
             data = resp.json()
+        except requests.exceptions.HTTPError as e:
+            print(f"[marketcheck] HTTP error at offset {start}: {e}")
+            break
         except (requests.exceptions.RequestException, ValueError) as e:
-            print(f"[marketcheck] {host} error: {e}")
-            return []
+            print(f"[marketcheck] Error at offset {start}: {e}")
+            break
 
         listings = data.get("listings", [])
-        if not listings and start == 0:
-            # Might be wrong response format
-            if "error" in data or "message" in data:
-                print(f"[marketcheck] API error: {data.get('error', data.get('message', ''))}")
-            return []
-
         if not listings:
+            if start == 0:
+                if "error" in data or "message" in data:
+                    print(f"[marketcheck] API message: "
+                          f"{data.get('error', data.get('message', ''))}")
+                else:
+                    print(f"[marketcheck] Empty response. Keys: {list(data.keys())}")
             break
 
         total = data.get("num_found", 0)
@@ -555,8 +678,7 @@ def _try_marketcheck_host(session, host, api_key, years):
 
         time.sleep(1.0)
 
-    if all_listings:
-        print(f"[marketcheck] Done. Total: {len(all_listings)}")
+    print(f"[marketcheck] Done. Total: {len(all_listings)}")
     return all_listings
 
 
@@ -576,12 +698,12 @@ def get_all_listings():
     if listings:
         return listings
 
-    # Fallback to AutoTrader internal API
+    # Fallback to AutoTrader (HTML scraping)
     listings = fetch_listings_autotrader()
     if listings:
         return listings
 
-    # Fallback to CarGurus
+    # Fallback to CarGurus (AJAX endpoint)
     listings = fetch_listings_cargurus()
     if listings:
         return listings
