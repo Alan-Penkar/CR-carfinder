@@ -250,83 +250,219 @@ def fetch_listings_cargurus_fallback():
     return all_listings
 
 
-def fetch_listings_rapidapi():
+def fetch_listings_marketcheck():
     """
-    Fetch used SUV listings via RapidAPI car listing APIs.
-    Tries multiple available APIs.
+    Fetch used SUV listings via MarketCheck API on RapidAPI.
+    MarketCheck aggregates 14M+ listings from 50k+ US dealers.
+    https://rapidapi.com/marketcheck/api/cars-search
     """
     from config import RAPIDAPI_KEY
 
     if not RAPIDAPI_KEY:
-        print("[listings] No RapidAPI key configured, skipping RapidAPI source")
+        print("[listings] No RapidAPI key configured, skipping MarketCheck")
         return []
 
-    all_listings = []
     session = _create_session()
+    all_listings = []
 
-    # Try the "real-time-used-car-search" API on RapidAPI
-    print("[listings] Querying RapidAPI car search...")
+    # Build year list for the range
+    years = ",".join(str(y) for y in range(
+        SEARCH_PARAMS["year_min"], SEARCH_PARAMS["year_max"] + 1
+    ))
+
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "cargurus-api.p.rapidapi.com",
+        "X-RapidAPI-Host": "marketcheck-prod.apigee.net",
     }
 
-    params = {
-        "zip": SEARCH_PARAMS["zip_code"],
-        "radius": SEARCH_PARAMS["radius_miles"],
-        "bodyType": "SUV",
-        "yearMin": SEARCH_PARAMS["year_min"],
-        "yearMax": SEARCH_PARAMS["year_max"],
-        "condition": "used",
-        "maxResults": min(SEARCH_PARAMS["max_results"], 200),
-    }
+    page_size = 50
+    start = 0
+    max_results = SEARCH_PARAMS["max_results"]
 
-    try:
-        resp = session.get(
-            "https://cargurus-api.p.rapidapi.com/search",
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    print(f"[listings] Querying MarketCheck API for used SUVs...")
 
-        results = data if isinstance(data, list) else data.get("results", data.get("listings", []))
-        for item in results:
+    while start < max_results:
+        params = {
+            "car_type": "used",
+            "body_type": "SUV",
+            "year": years,
+            "zip": SEARCH_PARAMS["zip_code"],
+            "radius": SEARCH_PARAMS["radius_miles"],
+            "rows": page_size,
+            "start": start,
+            "sort_by": "price",
+            "sort_order": "asc",
+        }
+
+        try:
+            resp = session.get(
+                "https://marketcheck-prod.apigee.net/v2/search/car/active",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.HTTPError as e:
+            # MarketCheck on RapidAPI may use a different host
+            # Fall back to the RapidAPI-proxied version
+            if start == 0:
+                print(f"[listings] MarketCheck direct failed ({e}), trying RapidAPI proxy...")
+                return _fetch_listings_marketcheck_rapidapi(session)
+            break
+        except (requests.exceptions.RequestException, ValueError) as e:
+            print(f"[listings] MarketCheck error at offset {start}: {e}")
+            break
+
+        listings = data.get("listings", [])
+        if not listings:
+            break
+
+        total = data.get("num_found", 0)
+
+        for item in listings:
+            dealer = item.get("dealer", {})
+            build = item.get("build", {})
             listing = {
-                "make": item.get("make", item.get("makeName", "")),
-                "model": item.get("model", item.get("modelName", "")),
-                "year": item.get("year", item.get("carYear", "")),
-                "trim": item.get("trim", item.get("trimName", "")),
-                "price": item.get("price", item.get("expectedPrice", "")),
-                "mileage": item.get("mileage", ""),
-                "exterior_color": item.get("exteriorColor", ""),
-                "interior_color": item.get("interiorColor", ""),
-                "engine": item.get("engine", ""),
-                "transmission": item.get("transmission", ""),
-                "drivetrain": item.get("drivetrain", item.get("driveTrain", "")),
-                "fuel_type": item.get("fuelType", ""),
-                "mpg_city": item.get("mpgCity", ""),
-                "mpg_highway": item.get("mpgHighway", ""),
+                "make": item.get("make", build.get("make", "")),
+                "model": item.get("model", build.get("model", "")),
+                "year": item.get("year", build.get("year", "")),
+                "trim": item.get("trim", build.get("trim", "")),
+                "price": item.get("price", ""),
+                "mileage": item.get("miles", item.get("mileage", "")),
+                "exterior_color": item.get("exterior_color", build.get("exterior_color", "")),
+                "interior_color": item.get("interior_color", build.get("interior_color", "")),
+                "engine": build.get("engine", item.get("engine", "")),
+                "transmission": build.get("transmission", item.get("transmission", "")),
+                "drivetrain": build.get("drivetrain", item.get("drivetrain", "")),
+                "fuel_type": build.get("fuel_type", item.get("fuel_type", "")),
+                "mpg_city": build.get("city_mpg", ""),
+                "mpg_highway": build.get("highway_mpg", ""),
                 "vin": item.get("vin", ""),
-                "stock_number": item.get("stockNumber", ""),
-                "seller_name": item.get("dealerName", item.get("sellerName", "")),
-                "seller_type": item.get("sellerType", ""),
-                "seller_city": item.get("city", ""),
-                "seller_state": item.get("state", ""),
-                "seller_distance_mi": item.get("distance", ""),
-                "listing_url": item.get("url", item.get("listingUrl", "")),
-                "days_on_market": item.get("daysOnMarket", ""),
-                "accidents_reported": item.get("accidentCount", ""),
-                "owner_count": item.get("ownerCount", ""),
+                "stock_number": item.get("stock_no", ""),
+                "seller_name": dealer.get("name", ""),
+                "seller_type": dealer.get("type", ""),
+                "seller_city": dealer.get("city", ""),
+                "seller_state": dealer.get("state", ""),
+                "seller_distance_mi": item.get("dist", ""),
+                "listing_url": item.get("vdp_url", ""),
+                "days_on_market": item.get("dom", item.get("days_on_market", "")),
+                "accidents_reported": "",
+                "owner_count": "",
+                "carfax_one_owner": item.get("carfax_1_owner", ""),
+                "carfax_clean_title": item.get("carfax_clean_title", ""),
             }
             if listing["make"] and listing["model"]:
                 all_listings.append(listing)
 
-        print(f"[listings] RapidAPI returned {len(all_listings)} listings")
-    except requests.exceptions.RequestException as e:
-        print(f"[listings] RapidAPI error: {e}")
+        print(f"[listings] MarketCheck: fetched {len(all_listings)} / {min(total, max_results)}")
 
+        start += page_size
+        if start >= total:
+            break
+
+        time.sleep(1.0)
+
+    print(f"[listings] MarketCheck done. Total: {len(all_listings)}")
+    return all_listings
+
+
+def _fetch_listings_marketcheck_rapidapi(session):
+    """
+    Try MarketCheck via the standard RapidAPI proxy hostname.
+    """
+    from config import RAPIDAPI_KEY
+
+    all_listings = []
+    years = ",".join(str(y) for y in range(
+        SEARCH_PARAMS["year_min"], SEARCH_PARAMS["year_max"] + 1
+    ))
+
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "cars-search.p.rapidapi.com",
+    }
+
+    page_size = 50
+    start = 0
+    max_results = SEARCH_PARAMS["max_results"]
+
+    while start < max_results:
+        params = {
+            "car_type": "used",
+            "body_type": "SUV",
+            "year": years,
+            "zip": SEARCH_PARAMS["zip_code"],
+            "radius": SEARCH_PARAMS["radius_miles"],
+            "rows": page_size,
+            "start": start,
+            "sort_by": "price",
+            "sort_order": "asc",
+        }
+
+        try:
+            resp = session.get(
+                "https://cars-search.p.rapidapi.com/v2/search/car/active",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            print(f"[listings] MarketCheck (RapidAPI) error at offset {start}: {e}")
+            break
+
+        listings = data.get("listings", [])
+        if not listings:
+            break
+
+        total = data.get("num_found", 0)
+
+        for item in listings:
+            dealer = item.get("dealer", {})
+            build = item.get("build", {})
+            listing = {
+                "make": item.get("make", build.get("make", "")),
+                "model": item.get("model", build.get("model", "")),
+                "year": item.get("year", build.get("year", "")),
+                "trim": item.get("trim", build.get("trim", "")),
+                "price": item.get("price", ""),
+                "mileage": item.get("miles", item.get("mileage", "")),
+                "exterior_color": item.get("exterior_color", ""),
+                "interior_color": item.get("interior_color", ""),
+                "engine": build.get("engine", ""),
+                "transmission": build.get("transmission", ""),
+                "drivetrain": build.get("drivetrain", ""),
+                "fuel_type": build.get("fuel_type", ""),
+                "mpg_city": build.get("city_mpg", ""),
+                "mpg_highway": build.get("highway_mpg", ""),
+                "vin": item.get("vin", ""),
+                "stock_number": item.get("stock_no", ""),
+                "seller_name": dealer.get("name", ""),
+                "seller_type": dealer.get("type", ""),
+                "seller_city": dealer.get("city", ""),
+                "seller_state": dealer.get("state", ""),
+                "seller_distance_mi": item.get("dist", ""),
+                "listing_url": item.get("vdp_url", ""),
+                "days_on_market": item.get("dom", ""),
+                "accidents_reported": "",
+                "owner_count": "",
+                "carfax_one_owner": item.get("carfax_1_owner", ""),
+                "carfax_clean_title": item.get("carfax_clean_title", ""),
+            }
+            if listing["make"] and listing["model"]:
+                all_listings.append(listing)
+
+        print(f"[listings] MarketCheck (RapidAPI): fetched {len(all_listings)} / {min(total, max_results)}")
+
+        start += page_size
+        if start >= total:
+            break
+
+        time.sleep(1.0)
+
+    print(f"[listings] MarketCheck (RapidAPI) done. Total: {len(all_listings)}")
     return all_listings
 
 
@@ -334,18 +470,20 @@ def get_all_listings():
     """
     Try multiple sources to get SUV listings. Returns the first successful
     non-empty result set.
+
+    Order: MarketCheck (RapidAPI, most reliable) -> AutoTrader -> CarGurus
     """
-    # Try AutoTrader first
+    # Try MarketCheck via RapidAPI first (best structured data)
+    listings = fetch_listings_marketcheck()
+    if listings:
+        return listings
+
+    # Fallback to AutoTrader internal API
     listings = fetch_listings()
     if listings:
         return listings
 
-    # Fallback to RapidAPI
-    listings = fetch_listings_rapidapi()
-    if listings:
-        return listings
-
-    # Fallback to CarGurus
+    # Fallback to CarGurus HTML scraping
     listings = fetch_listings_cargurus_fallback()
     if listings:
         return listings

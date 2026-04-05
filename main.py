@@ -60,6 +60,8 @@ CSV_COLUMNS = [
     "days_on_market",
     "accidents_reported",
     "owner_count",
+    "carfax_one_owner",
+    "carfax_clean_title",
     "vin",
     "stock_number",
     "listing_url",

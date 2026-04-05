@@ -257,53 +257,79 @@ def _extract_cr_from_json(data, year, result):
 
 def _fetch_cr_rapidapi(make, model, year):
     """
-    Try fetching CR-equivalent data from RapidAPI auto data services.
-    Some RapidAPI providers aggregate reliability data from multiple sources.
+    Try fetching CR data from the unofficial Consumer Reports API on RapidAPI
+    (by apidojo), plus supplemental vehicle specs from API Ninjas.
     """
     if not RAPIDAPI_KEY:
         return None
 
-    session = requests.Session()
+    session = _create_session()
+    result = {
+        "cr_overall_score": "",
+        "cr_reliability": "",
+        "cr_owner_satisfaction": "",
+        "cr_safety": "",
+        "cr_road_test_score": "",
+        "cr_predicted_reliability": "",
+        "cr_recommended": "",
+        "cr_url": "",
+    }
 
-    # Try "cars-by-api-ninjas" for basic specs/ratings
-    headers = {
+    # Try the unofficial Consumer Reports API on RapidAPI (apidojo)
+    make_slug = _normalize_name(make)
+    model_slug = _normalize_name(model)
+
+    cr_headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "consumer-reports.p.rapidapi.com",
+    }
+
+    try:
+        resp = session.get(
+            f"https://consumer-reports.p.rapidapi.com/cars/{make_slug}/{model_slug}/{year}",
+            headers=cr_headers,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                result["cr_overall_score"] = str(data.get("overallScore", data.get("overall_score", "")))
+                result["cr_reliability"] = str(data.get("reliability", data.get("reliabilityRating", "")))
+                result["cr_owner_satisfaction"] = str(data.get("ownerSatisfaction", data.get("owner_satisfaction", "")))
+                result["cr_safety"] = str(data.get("safety", ""))
+                result["cr_road_test_score"] = str(data.get("roadTestScore", data.get("road_test_score", "")))
+                result["cr_predicted_reliability"] = str(data.get("predictedReliability", data.get("predicted_reliability", "")))
+                result["cr_recommended"] = str(data.get("recommended", data.get("cr_recommended", "")))
+
+                if any(v for k, v in result.items() if k != "cr_url"):
+                    return result
+    except requests.exceptions.RequestException:
+        pass
+
+    # Supplement with vehicle specs from API Ninjas
+    ninja_headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": "cars-by-api-ninjas.p.rapidapi.com",
-    }
-    params = {
-        "make": make,
-        "model": model,
-        "year": year,
     }
 
     try:
         resp = session.get(
             "https://cars-by-api-ninjas.p.rapidapi.com/v1/cars",
-            headers=headers,
-            params=params,
+            headers=ninja_headers,
+            params={"make": make, "model": model, "year": year},
             timeout=15,
         )
         if resp.status_code == 200:
             data = resp.json()
             if data and isinstance(data, list) and len(data) > 0:
                 car = data[0]
-                return {
-                    "cr_overall_score": "",
-                    "cr_reliability": "",
-                    "cr_owner_satisfaction": "",
-                    "cr_safety": "",
-                    "cr_road_test_score": "",
-                    "cr_predicted_reliability": "",
-                    "cr_recommended": "",
-                    "cr_url": "",
-                    # Supplement with specs from API Ninjas
-                    "_api_class": car.get("class", ""),
-                    "_api_cylinders": car.get("cylinders", ""),
-                    "_api_displacement": car.get("displacement", ""),
-                    "_api_city_mpg": car.get("city_mpg", ""),
-                    "_api_highway_mpg": car.get("highway_mpg", ""),
-                    "_api_combination_mpg": car.get("combination_mpg", ""),
-                }
+                result["_api_class"] = car.get("class", "")
+                result["_api_cylinders"] = car.get("cylinders", "")
+                result["_api_displacement"] = car.get("displacement", "")
+                result["_api_city_mpg"] = car.get("city_mpg", "")
+                result["_api_highway_mpg"] = car.get("highway_mpg", "")
+                result["_api_combination_mpg"] = car.get("combination_mpg", "")
+                return result
     except requests.exceptions.RequestException:
         pass
 
