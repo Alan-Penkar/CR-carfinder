@@ -1,3 +1,6 @@
+TESTING CLAUDE CODE DIRECT ON REPO --  DOESN'T WORK AT ALL 
+
+
 # Atlanta Used SUV Finder with Consumer Reports Data
 
 Scrapes used SUV listings from multiple sources (AutoTrader, CarGurus, RapidAPI)
